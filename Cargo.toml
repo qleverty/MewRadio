@@ -1,0 +1,15 @@
+[package]
+name = "mewradio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "vorbis"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
