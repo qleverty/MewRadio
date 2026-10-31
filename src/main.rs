@@ -55,6 +55,19 @@ fn fatal(m: &str) -> ! {
     std::process::exit(1)
 }
 
+fn fit(ui: &Ui, s: &str, max: f32) -> String {
+    let font = TextStyle::Button.resolve(ui.style());
+    let width = |t: &str| ui.painter().layout_no_wrap(t.into(), font.clone(), TX).size().x;
+    let mut t: Vec<char> = s.chars().collect();
+    if width(s) <= max {
+        return s.into();
+    }
+    while !t.is_empty() && width(&format!("{}...", t.iter().collect::<String>())) > max {
+        t.pop();
+    }
+    format!("{}...", t.iter().collect::<String>())
+}
+
 fn row(ui: &mut Ui, e: Option<&Entry>, cur: bool, past: bool) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.), Sense::hover());
     let Some(e) = e else { return };
@@ -208,9 +221,18 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         if self.playing {
-            // smooth bar only while we are the focused window
-            let fps = if ctx.input(|i| i.focused) { 33 } else { 250 };
-            ctx.request_repaint_after(Duration::from_millis(fps));
+            // smooth bar only while window is focused 
+            let left = self.cur.dur - self.audio.sink.get_pos().as_secs_f32();
+            let wait = if ctx.input(|i| i.focused) {
+                0.033
+            } else if self.cur.dur <= 0. {
+                1.
+            } else if self.queued || self.rep {
+                (left + 0.1).clamp(0.2, 15.)
+            } else {
+                (left - 3.).clamp(0.2, 15.)
+            };
+            ctx.request_repaint_after(Duration::from_secs_f32(wait));
         }
     }
 
@@ -413,15 +435,18 @@ impl App {
     fn presets(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label("Preset:");
+            let font = TextStyle::Button.resolve(ui.style());
+            let btns: f32 = ["New", "Rename", "Delete"].iter().map(|s| ui.painter().layout_no_wrap(s.to_string(), font.clone(), TX).size().x + 2. * ui.spacing().button_padding.x).sum();
+            let w = (ui.available_width() - btns - 3. * ui.spacing().item_spacing.x).clamp(60., 240.);
             let mut done = None;
             if let Some(t) = &mut self.rename {
-                let r = ui.add_sized([240., ui.spacing().interact_size.y], TextEdit::singleline(t).id(Id::new("ren")));
+                let r = ui.add_sized([w, ui.spacing().interact_size.y], TextEdit::singleline(t).id(Id::new("ren")));
                 if r.lost_focus() {
                     done = Some(!ui.input(|i| i.key_pressed(Key::Escape)));
                 }
             } else {
                 let mut sel = self.pre.cur;
-                ComboBox::from_id_salt("pre").width(240.).selected_text(&self.pre.names[sel]).show_ui(ui, |ui| {
+                ComboBox::from_id_salt("pre").width(w).selected_text(fit(ui, &self.pre.names[sel], w - 36.)).show_ui(ui, |ui| {
                     for (i, n) in self.pre.names.iter().enumerate() {
                         ui.selectable_value(&mut sel, i, n);
                     }
@@ -498,7 +523,7 @@ fn main() -> eframe::Result {
         .or_else(|| std::env::current_exe().ok()?.parent().map(PathBuf::from))
         .unwrap_or_default();
     let pre = Presets::load(&root);
-    let mut vp = ViewportBuilder::default().with_inner_size([950., 650.]).with_min_inner_size([760., 460.]);
+    let mut vp = ViewportBuilder::default().with_inner_size([950., 576.]).with_min_inner_size([760., 460.]);
     if let Some([w, h, x, y]) = pre.win {
         vp = vp.with_inner_size([w, h]).with_position([x, y]);
     }

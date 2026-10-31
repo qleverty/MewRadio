@@ -100,16 +100,10 @@ impl Presets {
             .collect();
         names.sort_by_key(|n| n.to_lowercase());
         let state = root.join("state.txt");
-        let mut t = read(&state);
-        if t.is_empty() {
-            t = read(&root.join("lastpreset.txt"));
-        }
+        let t = read(&state);
         let (mut want, mut vol, mut win, mut split) = (String::new(), 1., None, 372.);
         for l in t.lines() {
-            let Some((k, v)) = l.split_once(':') else {
-                want = l.trim().into();
-                continue;
-            };
+            let Some((k, v)) = l.split_once(':') else { continue };
             let n: Vec<f32> = v.split('|').filter_map(|x| x.trim().parse().ok()).collect();
             match (k.trim(), n.as_slice()) {
                 ("preset", _) => want = v.trim().into(),
