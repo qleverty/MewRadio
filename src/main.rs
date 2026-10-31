@@ -1,15 +1,21 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod catalog;
 mod radio;
 mod rng;
 mod settings;
+mod shell;
+#[cfg(windows)]
+mod taskbar;
 
 use audio::Audio;
 use catalog::*;
 use eframe::egui::*;
 use radio::{Entry, Kind, Radio};
 use settings::Presets;
-use std::{collections::VecDeque, path::PathBuf, time::{Duration, Instant}};
+use shell::{Cmd, Shell};
+use std::{collections::VecDeque, path::{Path, PathBuf}, time::{Duration, Instant}};
 
 const fn c(h: u32) -> Color32 {
     Color32::from_rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
@@ -19,6 +25,7 @@ const P2: Color32 = c(0x2f2f2f);
 const TX: Color32 = c(0xdcdcd8);
 const MU: Color32 = c(0x8d8982);
 const SEL: Color32 = c(0x3a3a3a);
+const OFF: Color32 = c(0x232323);
 
 fn col(k: Kind) -> Color32 {
     match k {
@@ -54,11 +61,9 @@ fn row(ui: &mut Ui, e: Option<&Entry>, cur: bool, past: bool) {
     if cur {
         ui.painter().rect_filled(r, 0., SEL);
     }
-    let tc = if past { MU } else { TX };
+    let (tc, kc) = if past { (MU.gamma_multiply(0.8), col(e.kind).gamma_multiply(0.55)) } else { (TX, col(e.kind)) };
     let mut l = ui.new_child(UiBuilder::new().max_rect(r.with_max_x(r.right() - 44.)).layout(Layout::left_to_right(Align::Center)));
-    l.allocate_ui_with_layout(vec2(92., 22.), Layout::left_to_right(Align::Center), |ui| {
-        ui.add(Label::new(RichText::new(e.sub).color(col(e.kind))).truncate())
-    });
+    l.add(Label::new(RichText::new(e.sub).color(kc)).extend());
     l.add(Label::new(RichText::new(&e.title).color(tc)).truncate());
     let mut d = ui.new_child(UiBuilder::new().max_rect(r).layout(Layout::right_to_left(Align::Center)));
     d.label(RichText::new(mm(e.dur)).color(tc));
@@ -73,19 +78,19 @@ struct App {
     up: VecDeque<Entry>,
     playing: bool,
     rep: bool,
-    queued: bool, // next track is already in the sink
+    queued: bool,
     mix: [u32; 2],
     tab: usize,
     sub: usize,
     seek: Option<f32>,
     rename: Option<String>,
     msg: Option<(&'static str, Instant)>,
+    shell: Shell,
 }
 
 impl App {
-    fn new(root: PathBuf) -> Self {
+    fn new(cc: &eframe::CreationContext, pre: Presets, root: &Path) -> Self {
         let cat = Catalog::scan(&root.join("Audio"));
-        let pre = Presets::load(&root);
         if cat.songs_on(&Default::default()) == 0 {
             fatal("No songs found in the Audio folder (Songs, WMEW)");
         }
@@ -94,7 +99,7 @@ impl App {
         let mut radio = Radio::new(cat, &pre.cfg);
         let cur = radio.next();
         audio.add(&cur.path);
-        let mut a = App { radio, pre, audio, hist: VecDeque::new(), cur, up: VecDeque::new(), playing: true, rep: false, queued: false, mix: [0; 2], tab: 0, sub: 0, seek: None, rename: None, msg: None };
+        let mut a = App { radio, pre, audio, hist: VecDeque::new(), cur, up: VecDeque::new(), playing: true, rep: false, queued: false, mix: [0; 2], tab: 0, sub: 0, seek: None, rename: None, msg: None, shell: Shell::new(cc) };
         a.reload();
         a
     }
@@ -121,7 +126,6 @@ impl App {
         self.queued = false;
     }
 
-    // settings changed: rebuild the future (keeps the track queued)
     fn reload(&mut self) {
         if self.radio.cat.songs_on(&self.pre.cfg.off) == 0 {
             self.pre.cfg.off = Default::default();
@@ -136,6 +140,49 @@ impl App {
     fn apply(&mut self) {
         self.pre.touch(true);
         self.reload();
+    }
+
+    fn prev(&mut self) {
+        if self.audio.sink.get_pos().as_secs_f32() > 3. || self.hist.is_empty() {
+            self.play();
+        } else {
+            self.up.push_front(self.cur.clone());
+            self.cur = self.hist.pop_back().unwrap();
+            self.play();
+        }
+    }
+
+    fn next(&mut self) {
+        self.advance();
+        self.play();
+    }
+
+    fn set_playing(&mut self, on: bool) {
+        self.playing = on;
+        if on { self.audio.sink.play() } else { self.audio.sink.pause() }
+    }
+
+    fn cmd(&mut self, c: Cmd) {
+        match c {
+            Cmd::Prev => self.prev(),
+            Cmd::Next => self.next(),
+            Cmd::Play => self.set_playing(true),
+            Cmd::Pause => self.set_playing(false),
+            Cmd::Toggle => self.set_playing(!self.playing),
+        }
+    }
+
+    fn remember_window(&mut self, ctx: &Context) {
+        let (inner, outer, skip) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.inner_rect, v.outer_rect, v.minimized.unwrap_or(false) || v.maximized.unwrap_or(false))
+        });
+        let (Some(i), Some(o), false) = (inner, outer, skip) else { return };
+        let w = [i.width().round(), i.height().round(), o.min.x.round(), o.min.y.round()];
+        if self.pre.win != Some(w) {
+            self.pre.win = Some(w);
+            self.pre.touch(false);
+        }
     }
 
     fn warn(&mut self, m: &'static str) {
@@ -161,7 +208,9 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         if self.playing {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            // smooth bar only while we are the focused window
+            let fps = if ctx.input(|i| i.focused) { 33 } else { 250 };
+            ctx.request_repaint_after(Duration::from_millis(fps));
         }
     }
 
@@ -185,8 +234,7 @@ impl App {
     fn now(&mut self, ui: &mut Ui) {
         let (k, dur) = (self.cur.kind, self.cur.dur.max(0.1));
         let pos = self.audio.sink.get_pos().as_secs_f32();
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
+        ui.scope(|ui| {
             ui.visuals_mut().selection.bg_fill = col(k);
             ui.horizontal(|ui| {
                 ui.colored_label(col(k), self.cur.sub);
@@ -208,27 +256,21 @@ impl App {
             });
             ui.horizontal(|ui| {
                 if ui.button("Prev").clicked() {
-                    if pos > 3. || self.hist.is_empty() {
-                        self.play();
-                    } else {
-                        self.up.push_front(self.cur.clone());
-                        self.cur = self.hist.pop_back().unwrap();
-                        self.play();
-                    }
+                    self.prev();
                 }
                 if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
-                    self.playing = !self.playing;
-                    if self.playing { self.audio.sink.play() } else { self.audio.sink.pause() }
+                    self.set_playing(!self.playing);
                 }
                 if ui.button("Next").clicked() {
-                    self.advance();
-                    self.play();
+                    self.next();
                 }
-                ui.toggle_value(&mut self.rep, "Repeat");
+                if ui.add(Button::new("Repeat").fill(if self.rep { P2 } else { OFF })).clicked() {
+                    self.rep = !self.rep;
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().slider_width = 100.;
                     let mut v = self.pre.vol;
-                    if ui.add(Slider::new(&mut v, 0.0..=1.0).show_value(false)).changed() {
+                    if ui.add(Slider::new(&mut v, 0.0..=2.0).show_value(false)).changed() {
                         self.pre.vol = v;
                         self.audio.sink.set_volume(v);
                         self.pre.touch(false);
@@ -237,11 +279,11 @@ impl App {
                 });
             });
         });
+        ui.separator();
     }
 
     fn mix_panel(&mut self, ui: &mut Ui) {
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
+        {
             ui.horizontal(|ui| {
                 for (i, (n, k)) in [("Songs", Kind::Song), ("WMEW", Kind::Wmew), ("Voicelines", Kind::Voice)].into_iter().enumerate() {
                     if i > 0 {
@@ -279,7 +321,8 @@ impl App {
                 let hc = if resp.hovered() || resp.dragged() { Color32::WHITE } else { TX };
                 ui.painter().rect_filled(h.shrink2(vec2(1., 4.)), 0., hc);
             }
-        });
+        }
+        ui.separator();
     }
 
     fn set_mix(&mut self) {
@@ -422,8 +465,20 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
+        while let Ok(c) = self.shell.rx.try_recv() {
+            self.cmd(c);
+        }
         self.tick(ctx);
-        SidePanel::left("q").exact_width(372.).resizable(false).show(ctx, |ui| self.queue(ui));
+        let pos = self.audio.sink.get_pos().as_secs_f32();
+        self.shell.update(&self.cur.title, self.cur.sub, self.cur.dur, pos, self.playing);
+        self.remember_window(ctx);
+        let max = (ctx.content_rect().width() - 400.).max(240.);
+        let side = SidePanel::left("q").default_width(self.pre.split).width_range(240.0..=max).show(ctx, |ui| self.queue(ui));
+        let w = side.response.rect.width().round();
+        if w != self.pre.split {
+            self.pre.split = w;
+            self.pre.touch(false);
+        }
         TopBottomPanel::bottom("p").show(ctx, |ui| self.presets(ui));
         CentralPanel::default().show(ctx, |ui| {
             self.now(ui);
@@ -442,10 +497,12 @@ fn main() -> eframe::Result {
     let root = std::env::args().nth(1).map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok()?.parent().map(PathBuf::from))
         .unwrap_or_default();
-    let opt = eframe::NativeOptions {
-        viewport: ViewportBuilder::default().with_inner_size([950., 650.]).with_resizable(false),
-        ..Default::default()
-    };
+    let pre = Presets::load(&root);
+    let mut vp = ViewportBuilder::default().with_inner_size([950., 650.]).with_min_inner_size([760., 460.]);
+    if let Some([w, h, x, y]) = pre.win {
+        vp = vp.with_inner_size([w, h]).with_position([x, y]);
+    }
+    let opt = eframe::NativeOptions { viewport: vp, ..Default::default() };
     eframe::run_native("MewRadio", opt, Box::new(move |cc| {
         let mut v = Visuals::dark();
         v.panel_fill = BG;
@@ -459,6 +516,6 @@ fn main() -> eframe::Result {
             w.corner_radius = 0.into();
         }
         cc.egui_ctx.set_visuals(v);
-        Ok(Box::new(App::new(root)))
+        Ok(Box::new(App::new(cc, pre, &root)))
     }))
 }

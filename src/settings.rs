@@ -80,11 +80,13 @@ pub fn ok_name(n: &str) -> bool {
 
 pub struct Presets {
     dir: PathBuf,
-    last: PathBuf,
+    state: PathBuf,
     pub names: Vec<String>,
     pub cur: usize,
     pub cfg: Settings,
-    pub vol: f32,
+    pub vol: f32, // gain, 0..2 (0-200%)
+    pub win: Option<[f32; 4]>, // width, height, x, y
+    pub split: f32, // width of the queue panel
     dirty: Option<(Instant, bool)>,
 }
 
@@ -97,18 +99,33 @@ impl Presets {
             .filter(|n| ok_name(n))
             .collect();
         names.sort_by_key(|n| n.to_lowercase());
-        let last = root.join("lastpreset.txt");
-        let t = read(&last);
-        let mut l = t.lines();
-        let want = l.next().unwrap_or("").trim().to_string();
-        let vol = l.filter_map(|x| x.strip_prefix("volume:")).find_map(|x| x.trim().parse::<f32>().ok()).map_or(0.7, |v| (v / 100.).clamp(0., 1.));
+        let state = root.join("state.txt");
+        let mut t = read(&state);
+        if t.is_empty() {
+            t = read(&root.join("lastpreset.txt"));
+        }
+        let (mut want, mut vol, mut win, mut split) = (String::new(), 1., None, 372.);
+        for l in t.lines() {
+            let Some((k, v)) = l.split_once(':') else {
+                want = l.trim().into();
+                continue;
+            };
+            let n: Vec<f32> = v.split('|').filter_map(|x| x.trim().parse().ok()).collect();
+            match (k.trim(), n.as_slice()) {
+                ("preset", _) => want = v.trim().into(),
+                ("volume", [v]) => vol = (v / 100.).clamp(0., 2.),
+                ("window", [w, h, x, y]) if *w >= 300. && *h >= 200. && x.abs() < 30000. && y.abs() < 30000. => win = Some([*w, *h, *x, *y]),
+                ("split", [s]) if *s >= 100. => split = *s,
+                _ => {}
+            }
+        }
         let cur = names.iter().position(|n| same(n, &want)).unwrap_or(0);
-        let mut p = Presets { dir, last, names, cur, cfg: Settings::default(), vol, dirty: None };
+        let mut p = Presets { dir, state, names, cur, cfg: Settings::default(), vol, win, split, dirty: None };
         if p.names.is_empty() {
             p.cur = p.add("Unnamed");
         }
         p.cfg = Settings::parse(&read(&p.path()));
-        p.save_last();
+        p.save_state();
         p
     }
 
@@ -116,8 +133,12 @@ impl Presets {
         self.dir.join(format!("{}.txt", self.names[self.cur]))
     }
 
-    fn save_last(&self) {
-        write(&self.last, &format!("{}\nvolume:{}\n", self.names[self.cur], (self.vol * 100.).round()));
+    fn save_state(&self) {
+        let mut t = format!("preset:{}\nvolume:{}\nsplit:{}\n", self.names[self.cur], (self.vol * 100.).round(), self.split);
+        if let Some([w, h, x, y]) = self.win {
+            t += &format!("window:{w}|{h}|{x}|{y}\n");
+        }
+        write(&self.state, &t);
     }
 
     fn add(&mut self, n: &str) -> usize {
@@ -153,14 +174,14 @@ impl Presets {
         if p {
             write(&self.path(), &self.cfg.text());
         }
-        self.save_last();
+        self.save_state();
     }
 
     pub fn select(&mut self, i: usize) {
         self.flush();
         self.cur = i;
         self.cfg = Settings::parse(&read(&self.path()));
-        self.save_last();
+        self.save_state();
     }
 
     pub fn new_preset(&mut self) {
@@ -172,7 +193,7 @@ impl Presets {
         }
         self.cur = self.add(&n);
         self.cfg = Settings::default();
-        self.save_last();
+        self.save_state();
     }
 
     pub fn rename(&mut self, n: &str) -> bool {
@@ -187,7 +208,7 @@ impl Presets {
         }
         self.names[self.cur] = n.into();
         self.cur = self.sort(n);
-        self.save_last();
+        self.save_state();
         true
     }
 
@@ -200,6 +221,6 @@ impl Presets {
         self.names.remove(self.cur);
         self.cur = self.cur.min(self.names.len() - 1);
         self.cfg = Settings::parse(&read(&self.path()));
-        self.save_last();
+        self.save_state();
     }
 }
